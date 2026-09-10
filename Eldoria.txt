@@ -1,0 +1,1345 @@
+import random
+import time
+import pickle
+import sys
+import os
+import shutil
+import tempfile
+import threading
+import http.server
+import socketserver
+import webbrowser
+import select
+import glob
+ 
+#========================
+#------ SAVE SYSTEM -----
+#========================
+
+def player_to_dict(player):
+    # Convert player to dict, handling Pet serialization
+    data = player.__dict__.copy()
+    
+    # Convert Pet object to dict for safe serialization
+    if data.get('pet') and hasattr(data['pet'], '__dict__'):
+        pet_obj = data['pet']
+        data['pet'] = {
+            'name': pet_obj.name,
+            'kind': pet_obj.kind,
+            'level': pet_obj.level,
+            'exp': pet_obj.exp,
+            '_is_pet': True
+        }
+    
+    return data
+
+def dict_to_player(data):
+    try:
+        if not isinstance(data, dict) or 'name' not in data:
+            raise ValueError('Save data não tem formato esperado.')
+        
+        p = Player(data.get('name', 'Desconhecido'))
+
+        # Safe attribute restoration
+        allowed_extra = {'armor', 'inventory', 'skills', '_save_version', 'pet'}
+        for k, v in data.items():
+            if hasattr(p, k) or k in allowed_extra:
+                # Handle Pet deserialization
+                if k == 'pet' and isinstance(v, dict) and v.get('_is_pet'):
+                    pet = Pet(v.get('name', 'Companheiro'))
+                    pet.kind = v.get('kind', 'Familiar')
+                    pet.level = v.get('level', 1)
+                    pet.exp = v.get('exp', 0)
+                    setattr(p, k, pet)
+                # Handle armor dict with defaults
+                elif k == 'armor' and v is not None:
+                    armor = v.copy() if isinstance(v, dict) else None
+                    if armor:
+                        # Ensure armor has all required keys
+                        armor.setdefault('nome', 'Armadura Desconhecida')
+                        armor.setdefault('defesa', 0)
+                        armor.setdefault('durabilidade', 100)
+                        armor.setdefault('max_durabilidade', 100)
+                        armor.setdefault('efeito_especial', None)
+                        armor.setdefault('level', 1)
+                        armor.setdefault('enchantments', [])
+                    setattr(p, k, armor)
+                else:
+                    setattr(p, k, v)
+        
+        # Compatibilidade com saves antigos
+        p.class_name = getattr(p, 'class_name', 'Guerreiro')
+        p.attributes = getattr(p, 'attributes', {
+            'forca': 5, 'destreza': 5, 'constituicao': 5,
+            'inteligencia': 5, 'sabedoria': 5, 'sorte': 5
+        })
+        p.attribute_points = getattr(p, 'attribute_points', 0)
+        p.crit_chance = getattr(p, 'crit_chance', 5)
+        p.status_effects = getattr(p, 'status_effects', [])
+        p.skill_tree = getattr(p, 'skill_tree', [])
+        p.known_skills = getattr(p, 'known_skills', [] )
+        p.gold_bonus = getattr(p, 'gold_bonus', 0)
+        p.dungeon_floor_reached = getattr(p, 'dungeon_floor_reached', 0)
+        recalcular_estatisticas(p)
+        return p
+    except Exception as e:
+        print('❌ Erro ao recriar jogador:', e)
+        return None
+
+# --- improved pickle save/load with atomic write and backups ---
+def save_game(player, filename=None):
+    """Save game with atomic writes and backup."""
+    filename = filename or f'save_{player.name}.pkl'
+    tmp = filename + '.tmp'
+    backup = filename + '.bak'
+
+    data = player_to_dict(player)
+    data['_save_version'] = 2  # bump if you change save structure later
+
+    try:
+        # write to temp file first
+        with open(tmp, 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # create a backup of existing save if present
+        if os.path.exists(filename):
+            try:
+                shutil.copy2(filename, backup)
+            except Exception as e:
+                print(f'⚠️ Aviso: não foi possível criar backup: {e}')
+
+        # atomic replace
+        os.replace(tmp, filename)
+        print('💾 Jogo salvo com sucesso!')
+        return filename
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        print('❌ Erro ao salvar:', e)
+        return None
+
+def load_game(filename=None):
+    """Load game from save file with backup recovery."""
+    candidate = None
+    
+    if filename:
+        candidate = filename
+    else:
+        # Find save_*.pkl and save.pkl
+        saves = sorted(glob.glob('save_*.pkl') + glob.glob('save.pkl'))
+        if len(saves) == 0:
+            print('❌ Nenhum save encontrado no diretório atual.')
+            return None
+        elif len(saves) == 1:
+            candidate = saves[0]
+            print(f'🔎 Save encontrado: {candidate}')
+        else:
+            print('🔎 Saves encontrados:')
+            for i, s in enumerate(saves, start=1):
+                print(f'{i}. {s}')
+            try:
+                idx = int(input('Escolha o número do save para carregar (0 cancelar): '))
+                if idx == 0:
+                    return None
+                if 1 <= idx <= len(saves):
+                    candidate = saves[idx-1]
+                else:
+                    print('❌ Número inválido.')
+                    return None
+            except (ValueError, IndexError):
+                print('❌ Entrada inválida. Cancelando load.')
+                return None
+
+    if not candidate:
+        return None
+
+    try:
+        with open(candidate, 'rb') as f:
+            data = pickle.load(f)
+        
+        # validate basic shape
+        if not isinstance(data, dict) or 'name' not in data:
+            print('❌ Save inválido ou formato incorreto.')
+            return None
+        
+        p = dict_to_player(data)
+        if p is None:
+            print('❌ Falha ao reconstruir o jogador a partir do save.')
+            return None
+        
+        print(f'📂 Save carregado: {candidate}')
+        return p
+        
+    except FileNotFoundError:
+        print(f'❌ Arquivo de save não encontrado: {candidate}')
+        return None
+        
+    except (pickle.UnpicklingError, EOFError) as e:
+        print(f'❌ Save corrompido: {e}')
+        
+        # try backup recovery
+        backup = candidate + '.bak'
+        if os.path.exists(backup):
+            try:
+                with open(backup, 'rb') as f:
+                    data = pickle.load(f)
+                print('♻️ Backup encontrado — carregando backup...')
+                p = dict_to_player(data)
+                if p:
+                    try:
+                        shutil.copy2(backup, candidate)
+                        print('♻️ Backup restaurado como save principal.')
+                    except Exception as restore_err:
+                        print(f'⚠️ Não foi possível restaurar backup: {restore_err}')
+                    return p
+            except Exception as backup_err:
+                print(f'❌ Backup também corrompido: {backup_err}')
+        return None
+        
+    except Exception as e:
+        print(f'❌ Erro ao carregar save: {e}')
+        return None
+
+# --- serve a single file on localhost and open browser for download ---
+def serve_file_for_download(filepath, host='127.0.0.1', port=0, timeout=60):
+    """Serve save file via HTTP for download."""
+    if not os.path.exists(filepath):
+        print(f'❌ Arquivo de save não encontrado: {filepath}')
+        return
+
+    tempdir = tempfile.mkdtemp(prefix='eldoria_save_')
+    filename = os.path.basename(filepath)
+    target = os.path.join(tempdir, filename)
+    
+    try:
+        shutil.copy2(filepath, target)
+    except Exception as e:
+        print(f'❌ Falha ao preparar arquivo para download: {e}')
+        try:
+            shutil.rmtree(tempdir)
+        except Exception:
+            pass
+        return
+
+    prev_cwd = os.getcwd()
+    os.chdir(tempdir)
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # silence logs
+
+    httpd = None
+    try:
+        httpd = socketserver.TCPServer((host, port), QuietHandler)
+        assigned_port = httpd.server_address[1]
+        url = f'http://{host}:{assigned_port}/{filename}'
+
+        # Start server in background
+        def run_server():
+            try:
+                httpd.serve_forever()
+            except Exception as server_err:
+                print(f'⚠️ Erro no servidor: {server_err}')
+
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+
+        try:
+            print(f'🔗 Abrindo navegador para baixar: {url}')
+            webbrowser.open(url)
+            print(f'⏳ Servindo o save por até {timeout}s. Pressione Enter para parar antes.')
+
+            # Cross-platform wait for Enter or timeout
+            if os.name == 'nt':
+                # Windows: input() blocks and works reliably
+                try:
+                    input()
+                except (KeyboardInterrupt, EOFError):
+                    pass
+            else:
+                # Unix: use select with timeout to listen for stdin
+                try:
+                    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+                    if rlist:
+                        try:
+                            _ = sys.stdin.readline()
+                        except Exception:
+                            pass
+                except Exception:
+                    # fallback to blocking input if select fails
+                    try:
+                        input()
+                    except (KeyboardInterrupt, EOFError):
+                        pass
+        finally:
+            try:
+                httpd.shutdown()
+                httpd.server_close()
+            except Exception:
+                pass
+            t.join(timeout=1)
+
+    except Exception as e:
+        print(f'❌ Erro ao iniciar servidor de download: {e}')
+    finally:
+        os.chdir(prev_cwd)
+        try:
+            shutil.rmtree(tempdir)
+        except Exception as cleanup_err:
+            print(f'⚠️ Aviso ao limpar arquivos temporários: {cleanup_err}')
+        print('✅ Servidor parado.')
+
+ 
+#========================
+#------ LORE ----------
+#========================
+ 
+LORE_INTRO = [
+
+    '--- AS CRÔNICAS DE ELDORIA ---',
+    'O sol não brilha mais como antes...',
+    'A Calamidade desperta nas profundezas...',
+    'Eldoria aguarda um Sem-Nome.'
+
+]
+ 
+LORE_SCROLLS = [
+
+    'O 18º andar não deveria existir.',
+    'A luz aqui abaixo apodrece.',
+    'A capital foi arrancada do mundo.',
+
+]
+ 
+BOSS_LORE = {
+
+    1: ('Korg, o Cobrador', 'Você entrou sem pagar.'),
+    2: ('Sombra Faminta', 'Eu sinto seu medo.'),
+    9: ('Quimera Instável', 'Múltiplas almas, um corpo.'),
+    15: ('Arquiduque do Pavor', 'Você não deveria ter chegado aqui.'),
+    18: ('CALAMIDADE', 'O fim já começou.')
+
+}
+ 
+#========================
+#------ GAME DATA ------
+#========================
+ 
+ENEMY_TYPES = [
+
+    {'name': 'Lobo das Sombras', 'hp_base': 40, 'dmg_base': (5, 10), 'drop': 'Pele de Lobo'},
+    {'name': 'Goblin Sarnento', 'hp_base': 30, 'dmg_base': (3, 8), 'drop': 'Dente de Goblin'},
+    {'name': 'Aranha Enorme', 'hp_base': 35, 'dmg_base': (4, 9), 'drop': 'Veneno Grosso'},
+    {'name': 'Trovão Errante', 'hp_base': 45, 'dmg_base': (6, 12), 'drop': 'Fragmento de Trovão'},
+
+]
+ 
+QUESTS = [
+
+    {'id': 1, 'titulo': 'Caçar Lobos', 'descricao': 'Derrote 3 Lobos das Sombras.', 'target': {'enemy_name': 'Lobo das Sombras', 'count': 3}, 'recompensa_money': 120, 'recompensa_exp': 60},
+    {'id': 2, 'titulo': 'Coletar Veneno', 'descricao': 'Traga 2 Venenos Grossos.', 'target': {'item': 'Veneno Grosso', 'count': 2}, 'recompensa_money': 80, 'recompensa_exp': 40},
+    {'id': 3, 'titulo': 'Troféu do Chefe', 'descricao': 'Derrote um chefe e entregue sua cabeça.', 'target': {'boss': True, 'count': 1}, 'recompensa_money': 300, 'recompensa_exp': 200},
+
+]
+ 
+ACHIEVEMENT_DEFS = {
+
+    'first_kill': {'title': 'Iniciante', 'desc': 'Derrote seu primeiro inimigo.'},
+    'first_pet': {'title': 'Amigo Fiel', 'desc': 'Adote um companheiro.'},
+    'blacksmith_upgraded': {'title': 'Forjado', 'desc': 'Melhore algo no ferreiro.'},
+    'found_treasure': {'title': 'Explorador', 'desc': 'Encontre um baú no dungeon.'}
+
+}
+ 
+#========================
+#------ UTIL ----------
+#========================
+ 
+def slow_print(text, delay=0.08):
+
+    for c in text:
+
+        sys.stdout.write(c)
+        sys.stdout.flush()
+        time.sleep(delay)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+    time.sleep(0.01)
+ 
+#========================
+#------ PET / COMPANION -
+#========================
+ 
+class Pet:
+
+    def __init__(self, name, kind='Familiar'):
+        self.name = name
+        self.kind = kind
+        self.level = 1
+        self.exp = 0
+ 
+    def assist_damage(self, player_level):
+        # Pet deals small damage based on level
+        return random.randint(2, 5) + self.level + player_level
+    def gain_exp(self, amount):
+        self.exp += amount
+        while self.exp >= 50 * self.level:
+            self.exp -= 50 * self.level
+            self.level += 1
+            print(f'🐾 {self.name} subiu para Nív. {self.level}!')
+ 
+
+#========================
+#------ CLASSES / ATRIBUTOS
+#========================
+
+CLASS_DEFS = {
+    'Guerreiro': {
+        'max_health': 125, 'max_mana': 40,
+        'attributes': {'forca': 8, 'destreza': 5, 'constituicao': 8,
+                       'inteligencia': 3, 'sabedoria': 4, 'sorte': 5},
+        'starting_skill': 'Golpe Poderoso'
+    },
+    'Mago': {
+        'max_health': 85, 'max_mana': 85,
+        'attributes': {'forca': 3, 'destreza': 4, 'constituicao': 4,
+                       'inteligencia': 9, 'sabedoria': 7, 'sorte': 5},
+        'starting_skill': 'Bola Arcana'
+    },
+    'Ladino': {
+        'max_health': 100, 'max_mana': 50,
+        'attributes': {'forca': 6, 'destreza': 9, 'constituicao': 5,
+                       'inteligencia': 5, 'sabedoria': 4, 'sorte': 8},
+        'starting_skill': 'Ataque Furtivo'
+    },
+    'Paladino': {
+        'max_health': 115, 'max_mana': 60,
+        'attributes': {'forca': 7, 'destreza': 4, 'constituicao': 8,
+                       'inteligencia': 4, 'sabedoria': 8, 'sorte': 4},
+        'starting_skill': 'Golpe Sagrado'
+    }
+}
+
+SKILL_DEFS = {
+    'Golpe de Mana': {'custo': 10, 'tipo': 'magia', 'dano': 25, 'escala': 'inteligencia'},
+    'Golpe Poderoso': {'custo': 8, 'tipo': 'fisico', 'dano': 30, 'escala': 'forca'},
+    'Bola Arcana': {'custo': 12, 'tipo': 'magia', 'dano': 38, 'escala': 'inteligencia'},
+    'Ataque Furtivo': {'custo': 10, 'tipo': 'fisico', 'dano': 28, 'escala': 'destreza'},
+    'Golpe Sagrado': {'custo': 12, 'tipo': 'magia', 'dano': 32, 'escala': 'sabedoria'},
+    'Escudo Solar': {'custo': 15, 'tipo': 'hibrido', 'dano': 18, 'escala': 'sabedoria'},
+    'Explosão Estelar': {'custo': 25, 'tipo': 'magia', 'dano': 55, 'escala': 'inteligencia'},
+    'Golpe Brutal': {'custo': 18, 'tipo': 'fisico', 'dano': 60, 'escala': 'forca'},
+    'Passo Sombrio': {'custo': 15, 'tipo': 'fisico', 'dano': 35, 'escala': 'destreza'},
+}
+
+SKILL_TREE = {
+    'Golpe Poderoso': [('Golpe Brutal', 3)],
+    'Bola Arcana': [('Explosão Estelar', 5)],
+    'Ataque Furtivo': [('Passo Sombrio', 3)],
+    'Golpe Sagrado': [('Escudo Solar', 3)],
+    'Golpe de Mana': [('Escudo Solar', 3)],
+}
+
+STATUS_DEFS = {
+    'veneno': {'turns': 3, 'damage': 5},
+    'sangramento': {'turns': 3, 'damage': 4},
+    'queimando': {'turns': 2, 'damage': 8},
+    'atordoado': {'turns': 1, 'skip': True},
+    'fúria': {'turns': 3, 'damage_bonus': 0.5},
+}
+
+def escolher_classe():
+    print('\n════════ ESCOLHA SUA CLASSE ════════')
+    nomes = list(CLASS_DEFS)
+    for i, nome in enumerate(nomes, 1):
+        d = CLASS_DEFS[nome]
+        print(f'{i}. {nome} | ❤️ {d["max_health"]} | 💙 {d["max_mana"]}')
+    while True:
+        try:
+            escolha = int(input('> '))
+            if 1 <= escolha <= len(nomes):
+                return nomes[escolha - 1]
+        except ValueError:
+            pass
+        print('❌ Escolha inválida.')
+
+def recalcular_estatisticas(p):
+    a = p.attributes
+    p.max_health = 100 + a['constituicao'] * 5 + (p.level - 1) * 15
+    p.max_mana = 30 + a['inteligencia'] * 4 + a['sabedoria'] * 2 + (p.level - 1) * 10
+    p.crit_chance = min(50, 5 + a['destreza'] * 1.5 + a['sorte'] * 0.75)
+
+def mostrar_atributos(p):
+    print('\n════════ ATRIBUTOS ════════')
+    nomes = {
+        'forca': 'Força', 'destreza': 'Destreza',
+        'constituicao': 'Constituição', 'inteligencia': 'Inteligência',
+        'sabedoria': 'Sabedoria', 'sorte': 'Sorte'
+    }
+    for k, v in p.attributes.items():
+        print(f'{nomes[k]}: {v}')
+    print(f'📈 Pontos disponíveis: {p.attribute_points}')
+
+def distribuir_atributos(p):
+    while p.attribute_points > 0:
+        mostrar_atributos(p)
+        print('0. Sair')
+        op = input('Atributo para aumentar: ').strip().lower()
+        mapa = {
+            '1': 'forca', '2': 'destreza', '3': 'constituicao',
+            '4': 'inteligencia', '5': 'sabedoria', '6': 'sorte',
+            'forca': 'forca', 'destreza': 'destreza',
+            'constituicao': 'constituicao', 'inteligencia': 'inteligencia',
+            'sabedoria': 'sabedoria', 'sorte': 'sorte'
+        }
+        if op == '0':
+            break
+        if op in mapa:
+            p.attributes[mapa[op]] += 1
+            p.attribute_points -= 1
+            recalcular_estatisticas(p)
+            print(f'✅ {mapa[op].capitalize()} aumentada!')
+        else:
+            print('❌ Atributo inválido.')
+
+def unlock_skill(p, skill_name):
+    if skill_name in SKILL_DEFS and skill_name not in p.known_skills:
+        p.known_skills.append(skill_name)
+        p.skills.append({
+            'nome': skill_name,
+            'custo': SKILL_DEFS[skill_name]['custo']
+        })
+        print(f'✨ Nova habilidade desbloqueada: {skill_name}!')
+
+def skill_tree_menu(p):
+    print('\n════════ ÁRVORE DE HABILIDADES ════════')
+    unlocked = False
+    for base, options in SKILL_TREE.items():
+        if base in p.known_skills:
+            for skill_name, level_required in options:
+                status = 'DESBLOQUEADA' if skill_name in p.known_skills else f'Lv {level_required}'
+                print(f'{base} → {skill_name}: {status}')
+                if skill_name not in p.known_skills and p.level >= level_required:
+                    ans = input(f'Desbloquear {skill_name}? (s/n) ').lower()
+                    if ans == 's':
+                        unlock_skill(p, skill_name)
+                        unlocked = True
+    if not unlocked:
+        print('Nenhuma habilidade nova disponível.')
+
+def add_status(p, name, turns=None):
+    definition = STATUS_DEFS.get(name)
+    if not definition:
+        return
+    duration = turns or definition['turns']
+    for effect in p.status_effects:
+        if effect['name'] == name:
+            effect['turns'] = max(effect['turns'], duration)
+            return
+    p.status_effects.append({'name': name, 'turns': duration})
+
+def process_player_status(p):
+    skip_turn = False
+    for effect in list(p.status_effects):
+        name = effect['name']
+        definition = STATUS_DEFS.get(name, {})
+        damage = definition.get('damage', 0)
+        if damage:
+            p.health = max(0, p.health - damage)
+            print(f'☠️ {name.capitalize()} causa {damage} de dano!')
+        if definition.get('skip'):
+            skip_turn = True
+            print('😵 Você está atordoado e perdeu o turno!')
+        effect['turns'] -= 1
+        if effect['turns'] <= 0:
+            p.status_effects.remove(effect)
+            print(f'✨ Efeito {name} terminou.')
+    return skip_turn
+
+def crit_multiplier(p):
+    return 2.0 if random.uniform(0, 100) < p.crit_chance else 1.0
+
+def calculate_player_damage(p, base, attribute='forca'):
+    value = base + p.attributes.get(attribute, 0) * 2
+    for effect in p.status_effects:
+        if effect['name'] == 'fúria':
+            value = int(value * 1.5)
+    multiplier = crit_multiplier(p)
+    if multiplier > 1:
+        print('💥 ACERTO CRÍTICO!')
+    return max(1, int(value * multiplier))
+
+def boss_phase_damage_multiplier(hp, max_hp):
+    ratio = hp / max_hp
+    if ratio <= 0.25:
+        return 1.5
+    if ratio <= 0.50:
+        return 1.25
+    return 1.0
+
+#========================
+#------ PLAYER ---------
+#========================
+ 
+class Player:
+
+    def __init__(self, name, class_name='Guerreiro'):
+        self.name = name
+        self.class_name = class_name if class_name in CLASS_DEFS else 'Guerreiro'
+        class_data = CLASS_DEFS[self.class_name]
+        self.attributes = class_data['attributes'].copy()
+        self.attribute_points = 0
+        self.max_health = class_data['max_health']
+        self.health = self.max_health
+        self.max_mana = class_data['max_mana']
+        self.mana = self.max_mana
+        self.crit_chance = 5
+        self.status_effects = []
+        self.skill_tree = []
+        self.known_skills = ['Golpe de Mana']
+        if class_data['starting_skill'] not in self.known_skills:
+            self.known_skills.append(class_data['starting_skill'])
+        self.money = 50
+        self.weapon = 'Punhos'
+        self.weapon_level = 1
+        self.level = 1
+        self.exp = 0
+        self.exp_to_next = 50
+        # [SISTEMA DE ARMADURA] - Atributo inicial
+        self.armor = None
+        self.inventory = {
+            'pocoes': 1,
+            'cabecas_boss': [],
+            'drops': {},  # armazenamento para drops (pele, veneno, etc.)
+        }
+ 
+        self.skills = [
+
+            {'nome': 'Golpe de Mana', 'custo': 10}
+        ]
+ 
+        # Companion
+        self.pet = None
+        # Quests
+        self.active_quests = []  # stores quest dicts with progress
+        self.completed_quests = []
+        # Achievements
+        self.achievements = {}
+    def display_status(self):
+
+        # [SISTEMA DE ARMADURA] - status
+        armor_name = self.armor['nome'] if self.armor else 'Nenhuma'
+        armor_lvl = f" (Nív. {self.armor.get('level', 1)})" if self.armor else ""
+        dur = f"{self.armor['durabilidade']}/{self.armor['max_durabilidade']}" if self.armor else '0/0'
+        pet_name = f' | 🐾 {self.pet.name} Lv{self.pet.level}' if self.pet else ''
+        ach_count = len(self.achievements)
+
+        # >>> Correção: definir status_text antes de usar no print
+        status_text = ', '.join([e.get('name', '') for e in self.status_effects]) if self.status_effects else 'Nenhum'
+
+        print(
+
+            f'\n👤 {self.name} | LVL {self.level} | '
+            f'❤️ {self.health}/{self.max_health} | '
+            f'✨ {self.mana}/{self.max_mana} | '
+            f'💰 {self.money}g\n'
+            f'⚔️ {self.weapon} Lvl.{self.weapon_level} | '
+            f'🛡️ {armor_name}{armor_lvl} (Dur: {dur}){pet_name} | 🏆 {ach_count}\n'
+            f'💥 Crítico: {self.crit_chance:.1f}% | 📈 Pontos: {self.attribute_points} | '
+            f'☠️ Status: {status_text}'
+        )
+ 
+    def gain_exp(self, amount):
+        self.exp += amount
+        print(f'✨ +{amount} EXP')
+        while self.exp >= self.exp_to_next:
+            self.exp -= self.exp_to_next
+            self.level += 1
+            self.exp_to_next = int(self.exp_to_next * 1.25)
+            self.attribute_points += 2
+            old_max_health = self.max_health
+            old_max_mana = self.max_mana
+            recalcular_estatisticas(self)
+            self.health = self.max_health
+            self.mana = self.max_mana
+            slow_print(f'🎉 LEVEL UP {self.level}! +2 pontos de atributo')
+            if self.level >= 3:
+                skill_tree_menu(self)
+        # pet gets a bit of exp when player levels or gains exp
+        if self.pet:
+            self.pet.gain_exp(int(amount / 4))
+    def add_drop(self, item, count=1):
+        self.inventory['drops'][item] = self.inventory['drops'].get(item, 0) + count
+    def check_quests_progress(self, enemy_name=None, drop_item=None, boss_killed=False):
+        for q in list(self.active_quests):
+            prog = q.setdefault('progress', 0)
+            target = q['target']
+            updated = False
+            if 'enemy_name' in target and enemy_name == target['enemy_name']:
+                q['progress'] = prog + 1
+                updated = True
+            if 'item' in target and drop_item == target['item']:
+                # A missão acompanha a quantidade realmente obtida no inventário.
+                available = self.inventory.get('drops', {}).get(drop_item, 0)
+                q['progress'] = min(available, target.get('count', 1))
+                updated = True
+            if 'boss' in target and boss_killed and target['boss']:
+                q['progress'] = prog + 1
+                updated = True
+            if updated:
+
+                print(f'📜 Progresso da missão "{q["titulo"]}": {q["progress"]}/{target.get("count",1)}')
+
+                if q['progress'] >= target.get('count', 1):
+
+                    # complete
+
+                    self.money += q['recompensa_money']
+                    self.gain_exp(q['recompensa_exp'])
+                    print(f'🏁 Missão completa: {q["titulo"]}! +{q["recompensa_money"]}g +{q["recompensa_exp"]} EXP')
+                    self.completed_quests.append(q)
+                    self.active_quests.remove(q)
+ 
+#========================
+#------ VILA ----------
+#========================
+ 
+def blacksmith(p):
+    slow_print('⚒️ Ferreiro: aço não mente.')
+    # [SISTEMA DE ARMADURA] - Opções de Compra, Upgrade e Reparo
+    print('1. Comprar Armas | 2. Comprar Armaduras | 3. Upgrade/Enchant | 4. Reparar Armadura (50g) | 5. Sair')
+    op = input('> ')
+    if op == '1':
+        print('1. Espada (100g) | 2. Machado (200g)')
+        c = input('> ')
+        if c == '1' and p.money >= 100:
+            p.money -= 100
+            p.weapon = 'Espada'
+            p.weapon_level = 2
+        elif c == '2' and p.money >= 200:
+            p.money -= 200
+            p.weapon = 'Machado'
+            p.weapon_level = 3
+        if c in ['1','2']:
+            unlock_achievement(p, 'blacksmith_upgraded')
+    elif op == '2':
+        # [SISTEMA DE ARMADURA] - Tipos de Armadura para compra
+        print('1. Cota de Malha (150g) [Def: 2]')
+        print('2. Armadura de Espinhos (300g) [Def: 4]')
+        print('3. Manto Vampírico (500g) [Def: 6]')
+        c = input('> ')
+        if c == '1' and p.money >= 150:
+            p.money -= 150
+            p.armor = {'nome': 'Cota de Malha', 'defesa': 2, 'durabilidade': 100, 'max_durabilidade': 100, 'efeito_especial': None, 'level': 1, 'enchantments': []}
+        elif c == '2' and p.money >= 300:
+            p.money -= 300
+            p.armor = {'nome': 'Armadura de Espinhos', 'defesa': 4, 'durabilidade': 120, 'max_durabilidade': 120, 'efeito_especial': 'espinhos_caoticos', 'level': 1, 'enchantments': []}
+        elif c == '3' and p.money >= 500:
+            p.money -= 500
+            p.armor = {'nome': 'Manto Vampírico', 'defesa': 6, 'durabilidade': 150, 'max_durabilidade': 150, 'efeito_especial': 'sede_de_sangue', 'level': 1, 'enchantments': []}
+    elif op == '3':
+        print('O que deseja melhorar? (Custo: 100g para upgrade, 200g para encantar)')
+        print('1. Arma | 2. Armadura (Upgrade) | 3. Encantar Armadura')
+        u = input('> ')
+        if u == '1' and p.money >= 100:
+            p.money -= 100
+            p.weapon_level += 1
+            print(f'⚔️ Sua {p.weapon} agora é Nível {p.weapon_level}!')
+            unlock_achievement(p, 'blacksmith_upgraded')
+        elif u == '2':
+            if p.money >= 100:
+                if p.armor:
+                    p.money -= 100
+                    p.armor['level'] = p.armor.get('level', 1) + 1
+                    p.armor['defesa'] += 3
+                    p.armor['max_durabilidade'] += 20
+                    print(f'🛡️ Sua {p.armor["nome"]} agora é Nível {p.armor["level"]}! (Defesa +3)')
+                    unlock_achievement(p, 'blacksmith_upgraded')
+                else:
+                    print('❌ Você não tem armadura para melhorar.')
+            else:
+                print('❌ Dinheiro insuficiente.')
+        elif u == '3':
+            if not p.armor:
+                print('❌ Sem armadura para encantar.')
+            elif p.money < 200:
+                print('❌ Dinheiro insuficiente para encantar.')
+            else:
+                print('Escolha um encantamento: 1.Fogo (+2 def) | 2.Vida (cura em hits) | 3.Espinhos+ (retaliação)')
+                e = input('> ')
+                if e == '1':
+                    p.money -= 200
+                    p.armor.setdefault('enchantments', []).append('fogo')
+                    p.armor['defesa'] += 2
+                    print('✨ Encantamento de Fogo adicionado!')
+                elif e == '2':
+                    p.money -= 200
+                    p.armor.setdefault('enchantments', []).append('vida')
+                    print('✨ Encantamento de Vida adicionado!')
+                elif e == '3':
+                    p.money -= 200
+                    p.armor.setdefault('enchantments', []).append('espinhos_plus')
+                    print('✨ Encantamento de Espinhos adicionado!')
+                unlock_achievement(p, 'blacksmith_upgraded')
+    elif op == '4' and p.money >= 50:
+        # [SISTEMA DE ARMADURA] - Reparo de Durabilidade
+        if p.armor:
+            p.money -= 50
+            p.armor['durabilidade'] = p.armor['max_durabilidade']
+            print('🛠️ Armadura como nova!')
+        else:
+            print('❌ Sem armadura para reparar.')
+# Companion management
+def companion_menu(p):
+    slow_print('🐾 Companheiro')
+    print('1. Adotar Companheiro | 2. Mostrar Companheiro | 3. Alimentar (level up 50g) | 4. Sair')
+    c = input('> ')
+    if c == '1':
+        if p.pet:
+            print('❌ Você já tem um companheiro.')
+        else:
+            name = input('Nome do companheiro: ')
+            p.pet = Pet(name)
+            print(f'🐾 {name} juntou-se à sua aventura!')
+            unlock_achievement(p, 'first_pet')
+    elif c == '2':
+        if p.pet:
+            print(f'🐾 {p.pet.name} | Tipo: {p.pet.kind} | Nív.: {p.pet.level} | EXP: {p.pet.exp}')
+        else:
+            print('❌ Nenhum companheiro.')
+    elif c == '3':
+        if p.pet and p.money >= 50:
+            p.money -= 50
+            p.pet.gain_exp(60)
+            print(f'🍖 {p.pet.name} está mais forte!')
+        else:
+            print('❌ Sem companheiro ou dinheiro.')
+def alchemist(p):
+    slow_print('🧪 Alquimista: cura ou mana?')
+    print('1. Poção (30g) | 2. Mana (40g)')
+    c = input('> ')
+    if c == '1' and p.money >= 30:
+        p.money -= 30
+
+        p.inventory['pocoes'] += 1
+    elif c == '2' and p.money >= 40:
+        p.money -= 40
+        p.mana = p.max_mana
+def guild(p):
+    slow_print('📜 Guilda')
+    print('1. Vender troféus | 2. Missão | 3. Quadro de Missões | 4. Sair')
+    c = input('> ')
+    if c == '1':
+        if p.inventory['cabecas_boss']:
+            p.money += len(p.inventory['cabecas_boss']) * 100
+            p.inventory['cabecas_boss'] = []
+    elif c == '2':
+
+        # small default mission
+        p.money += 50
+        p.gain_exp(20)
+    elif c == '3':
+        quest_board(p)
+def quest_board(p):
+    slow_print('📌 Quadro de Missões')
+
+    print('Missões disponíveis:')
+    for q in QUESTS:
+        # don't show already active or completed
+        if any(a['id'] == q['id'] for a in p.active_quests): continue
+        if any(c['id'] == q['id'] for c in p.completed_quests): continue
+        print(f'{q["id"]}. {q["titulo"]} - {q["descricao"]} (Recompensa: {q["recompensa_money"]}g, {q["recompensa_exp"]} EXP)')
+    print('Digite o número da missão para aceitar, ou Enter para sair.')
+    choose = input('> ')
+    try:
+        qid = int(choose)
+        q = next((x for x in QUESTS if x['id']==qid), None)
+        if q:
+            p.active_quests.append(q.copy())
+            print(f'✅ Missão "{q["titulo"]}" aceita.')
+    except:
+        pass
+
+#===========================================
+#------ COMBATE (COM DEFESA ADAPTADA) ------
+#===========================================
+ 
+def aplicar_encantamentos_armor(armadura, dano_reduzido, player):
+    # Aplica efeitos extras de encantamentos
+    if not armadura:
+        return dano_reduzido
+    if 'vida' in armadura.get('enchantments', []):
+        # chance de curar quando toma dano
+        if random.randint(1,100) <= 20:
+
+            cura = min(player.max_health - player.health, 10)
+            player.health += cura
+            print(f'✨ Encantamento de Vida cura +{cura} HP!')
+    if 'espinhos_plus' in armadura.get('enchantments', []):
+        if random.randint(1,100) <= 25:
+            print('💥 Encantamento de Espinhos causa dano de retorno!')
+            # does not alter incoming damage, but will be handled as effect elsewhere
+    if 'fogo' in armadura.get('enchantments', []):
+                             # proteção extra já foi aplicada via defesa stat
+        pass
+    return dano_reduzido
+def calcular_defesa_integrada(dano_inimigo, player):
+    # [SISTEMA DE ARMADURA] - Efeitos especias, dano, defesa
+    if not player.armor:
+        return dano_inimigo
+    armadura = player.armor
+    if armadura['durabilidade'] <= 0:
+        print(f'⚠️ Sua {armadura["nome"]} está em pedaços!')
+        return dano_inimigo
+
+    dano_reduzido = max(0, dano_inimigo - armadura['defesa'])
+    desgaste = max(1, int(dano_inimigo * 0.1))
+    armadura['durabilidade'] = max(0, armadura['durabilidade'] - desgaste) 
+    efeito_ativado = False
+    if armadura.get('efeito_especial') == 'sede_de_sangue':
+        if random.randint(1, 100) <= 25:
+            efeito_ativado = True
+            cura = dano_inimigo
+            player.health = min(player.max_health, player.health + cura)
+            print(f'🦇 {armadura["nome"]} suga a vitalidade! +{cura} HP!')
+            dano_reduzido = 0
+
+    elif armadura.get('efeito_especial') == 'espinhos_caoticos':
+        if random.randint(1, 100) <= 20:
+            efeito_ativado = True
+            print(f'💥 {armadura["nome"]} reflete parte do ataque!')
+            dano_reduzido = int(dano_reduzido / 2) 
+    if not efeito_ativado:
+        print(f'⚔️ Defesa: {armadura["defesa"]} | Dano final: {dano_reduzido}') 
+    # apply enchantments effects
+    dano_reduzido = aplicar_encantamentos_armor(armadura, dano_reduzido, player)
+    return dano_reduzido
+def spawn_enemy(floor):
+    # choose enemy type and scale with floor
+    base = random.choice(ENEMY_TYPES)
+    name = base['name']
+    hp = base['hp_base'] + floor * 3
+    dmg_min, dmg_max = base['dmg_base']
+    dmg_range = (dmg_min + floor//4, dmg_max + floor//3)
+    return {'name': name, 'hp': hp, 'dmg_range': dmg_range, 'drop': base.get('drop')}
+def combat(p, enemy, hp, dmg_range, boss=False):
+    enemy_name = enemy if isinstance(enemy, str) else enemy.get('name', str(enemy))
+    max_hp = hp
+    phase_announced = set()
+
+    if boss:
+        slow_print(f'🔥 {enemy_name}')
+
+    while hp > 0 and p.health > 0:
+        print(f'\n{enemy_name} HP:{hp}/{max_hp} | Player HP:{p.health}/{p.max_health}')
+
+        # Bosses possuem fases de 50% e 25%.
+        if boss:
+            ratio = hp / max_hp
+            if ratio <= 0.50 and 50 not in phase_announced:
+                phase_announced.add(50)
+                print(f'⚠️ {enemy_name} entrou na FASE 2! Dano aumentado!')
+            if ratio <= 0.25 and 25 not in phase_announced:
+                phase_announced.add(25)
+                print(f'☠️ {enemy_name} entrou na FASE FINAL! Dano muito aumentado!')
+
+        if process_player_status(p):
+            if p.health <= 0:
+                return False
+            # Mesmo perdendo o turno, o inimigo ainda pode atacar.
+            raw_dmg = random.randint(*dmg_range)
+            if boss:
+                raw_dmg = int(raw_dmg * boss_phase_damage_multiplier(hp, max_hp))
+            final_dmg = calcular_defesa_integrada(raw_dmg, p)
+            p.health -= final_dmg
+            continue
+
+        print('1.Atacar 2.Habilidades 3.Poção 4.Defender 5.Técnicas 6.Fugir')
+        c = input('> ')
+        extra_defense = 0
+
+        if c == '1':
+            base = random.randint(8, 18) + p.weapon_level * 2
+            dmg = calculate_player_damage(p, base, 'forca')
+            hp -= dmg
+            print(f'⚔️ Você causou {dmg} de dano!')
+
+            if p.pet:
+                pet_dmg = p.pet.assist_damage(p.level)
+                print(f'🐾 {p.pet.name} ajuda! +{pet_dmg} dano')
+                hp -= pet_dmg
+
+        elif c == '2':
+            print('\n✨ HABILIDADES')
+            for i, s in enumerate(p.skills, 1):
+                print(f'{i}. {s["nome"]} ({s["custo"]} mana)')
+            try:
+                idx = int(input('Escolha: ')) - 1
+                skill = p.skills[idx]
+                definition = SKILL_DEFS.get(skill['nome'], SKILL_DEFS['Golpe de Mana'])
+
+                if p.mana >= skill['custo']:
+                    p.mana -= skill['custo']
+                    damage = calculate_player_damage(
+                        p,
+                        definition['dano'] + p.level * 2,
+                        definition['escala']
+                    )
+                    hp -= damage
+                    print(f'✨ {skill["nome"]} causou {damage} de dano!')
+
+                    if skill['nome'] == 'Escudo Solar':
+                        heal = min(p.max_health - p.health, 15 + p.level * 2)
+                        p.health += heal
+                        print(f'☀️ Você recuperou {heal} HP!')
+
+                    elif skill['nome'] == 'Golpe Sagrado':
+                        heal = min(p.max_health - p.health, 8 + p.level)
+                        p.health += heal
+                        print(f'✝️ Luz sagrada cura {heal} HP!')
+
+                    elif skill['nome'] == 'Ataque Furtivo':
+                        add_status(p, 'fúria', 1)
+
+                else:
+                    print('❌ Mana insuficiente!')
+            except (ValueError, IndexError):
+                print('❌ Habilidade inválida.')
+
+        elif c == '3' and p.inventory['pocoes'] > 0:
+            p.inventory['pocoes'] -= 1
+            heal = min(p.max_health - p.health, 50)
+            p.health += heal
+            print(f'🧪 Você recuperou {heal} HP!')
+
+        elif c == '4':
+            extra_defense = random.randint(8, 18)
+            print(f'🛡️ Você se prepara para defender! +{extra_defense} defesa.')
+
+        elif c == '5':
+            print('1. Fúria (+50% dano por 3 turnos)')
+            print('2. Purificar (remove efeitos negativos)')
+            tech = input('> ')
+            if tech == '1':
+                add_status(p, 'fúria', 3)
+                print('🔥 Você entrou em estado de FÚRIA!')
+            elif tech == '2':
+                before = len(p.status_effects)
+                p.status_effects = [
+                    e for e in p.status_effects if e['name'] == 'fúria'
+                ]
+                print(f'✨ {before - len(p.status_effects)} efeitos negativos removidos!')
+
+        elif c == '6' and not boss:
+            if random.random() < 0.5:
+                print('🏃 Você conseguiu fugir!')
+                return 'fled'
+            print('❌ Você não conseguiu fugir!')
+
+        else:
+            print('❌ Ação inválida.')
+
+        # Inimigo ataca se ainda estiver vivo.
+        if hp > 0:
+            raw_dmg = random.randint(*dmg_range)
+
+            # Boss fica mais perigoso nas fases seguintes.
+            if boss:
+                raw_dmg = int(raw_dmg * boss_phase_damage_multiplier(hp, max_hp))
+
+            # Alguns inimigos têm efeitos especiais.
+            if isinstance(enemy, dict):
+                if enemy_name == 'Aranha Enorme' and random.randint(1, 100) <= 20:
+                    add_status(p, 'veneno')
+                    print('🕷️ A Aranha Enorme envenenou você!')
+                elif enemy_name == 'Trovão Errante' and random.randint(1, 100) <= 15:
+                    add_status(p, 'atordoado')
+                    print('⚡ O Trovão Errante deixou você atordoado!')
+
+            final_dmg = max(0, calcular_defesa_integrada(raw_dmg, p) - extra_defense)
+
+            # Retaliação do encantamento acontece uma única vez.
+            if p.armor and 'espinhos_plus' in p.armor.get('enchantments', []):
+                if random.randint(1, 100) <= 25:
+                    retaliation = max(1, int(raw_dmg * 0.25))
+                    hp -= retaliation
+                    print(f'💥 Espinhos+ causa {retaliation} de dano de retorno!')
+
+            p.health -= final_dmg
+            print(f'💢 Você sofreu {final_dmg} de dano!')
+
+    if p.health <= 0:
+        print('💀 Você foi derrotado!')
+        return False
+
+    if isinstance(enemy, dict):
+        drop = enemy.get('drop')
+        if drop:
+            p.add_drop(drop, 1)
+            print(f'🎁 Obteve drop: {drop}')
+            p.check_quests_progress(drop_item=drop)
+        p.check_quests_progress(enemy_name=enemy_name)
+    else:
+        p.check_quests_progress(enemy_name=enemy_name)
+
+    if boss:
+        p.inventory['cabecas_boss'].append(enemy_name)
+        p.check_quests_progress(boss_killed=True)
+
+    p.gain_exp(100 if boss else 30)
+
+    if 'first_kill' not in p.achievements:
+        unlock_achievement(p, 'first_kill')
+
+    return True
+
+#========================
+#------ RANDOM EVENTS ---
+#========================
+ 
+def dungeon_random_event(p, floor):
+
+    r = random.randint(1, 100)
+
+    if r <= 15:
+
+        # merchant
+
+        slow_print('🧑‍🌾 Um mercador perdido aparece...')
+
+        print('1. Comprar Poção (10g) | 2. Comprar Reparo Rápido (30g) | 3. Nada')
+
+        c = input('> ')
+
+        if c == '1' and p.money >= 10:
+
+            p.money -= 10
+
+            p.inventory['pocoes'] += 1
+
+        elif c == '2' and p.money >= 30 and p.armor:
+
+            p.money -= 30
+
+            p.armor['durabilidade'] = min(p.armor['max_durabilidade'], p.armor['durabilidade'] + 40)
+
+    elif r <= 30:
+
+        # trap
+
+        slow_print('⚠️ Armadilha! Alguns espinhos saem do chão...')
+
+        dmg = random.randint(5, 15)
+
+        final = calcular_defesa_integrada(dmg, p)
+
+        p.health -= max(0, final)
+
+        print(f'Você sofreu {max(0, final)} de dano na armadilha.')
+
+    elif r <= 45:
+
+        # shrine
+
+        slow_print('🔮 Um santuário antigo... você sente uma presença benevolente.')
+
+        if random.randint(1,100) <= 50:
+
+            p.mana = min(p.max_mana, p.mana + 20)
+
+            print('✨ Mana restaurada parcialmente.')
+
+        else:
+
+            p.add_drop('Relíquia Antiga', 1)
+
+            print('🎁 Você encontrou uma Relíquia Antiga!')
+
+            unlock_achievement(p, 'found_treasure')
+
+    else:
+
+        # lore scroll
+
+        slow_print(random.choice(LORE_SCROLLS))
+ 
+#========================
+#------ DUNGEON -------
+#========================
+ 
+def dungeon(p):
+
+    floor = 1
+
+    while floor <= 18:
+
+        print(f'\n--- FLOOR {floor} ---')
+
+        act = input('1.Avançar 2.Descansar 3.Sair ')
+
+        if act == '1':
+
+            # random event chance before encounters
+
+            if random.randint(1,100) <= 25:
+
+                dungeon_random_event(p, floor)
+ 
+            # [SISTEMA DE ARMADURA] - Garantido no 6
+
+            if floor == 6 and not p.armor:
+
+                found = {'nome': 'Cota de Malha Velha', 'defesa': 2, 'durabilidade': 50, 'max_durabilidade': 80, 'efeito_especial': None, 'level': 1, 'enchantments': []}
+
+                slow_print(f'🎁 Você encontrou um baú no andar 6! Contém uma {found["nome"]}.')
+
+                if input('Equipar? 1.Sim 2.Não > ') == '1':
+
+                    p.armor = found
+
+                    print('🛡️ Armadura equipada!')
+
+                    unlock_achievement(p, 'found_treasure')
+ 
+            r = random.randint(1, 100)
+
+            if r < 40:
+
+                # spawn a varied enemy
+
+                e = spawn_enemy(floor)
+
+                combat(p, e, e['hp'], e['dmg_range'])
+
+            elif r < 70:
+
+                slow_print(random.choice(LORE_SCROLLS))
+
+            else:
+
+                boss = BOSS_LORE.get(floor)
+
+                if boss:
+
+                    name, talk = boss
+
+                    slow_print(f'{name}: {talk}')
+
+                    if combat(p, name, 120 + floor * 20, (10, 20 + floor), True): floor += 1
+
+                    else: break
+
+                else: floor += 1
+
+        elif act == '2':
+
+            p.mana = p.max_mana
+
+            print('✨ Mana restaurada!')
+
+        elif act == '3': break
+ 
+#========================
+#------ ACHIEVEMENTS ---
+#========================
+ 
+def unlock_achievement(p, key):
+
+    if key in ACHIEVEMENT_DEFS and key not in p.achievements:
+
+        p.achievements[key] = ACHIEVEMENT_DEFS[key]
+
+        print(f'🏆 Conquista desbloqueada: {ACHIEVEMENT_DEFS[key]["title"]} - {ACHIEVEMENT_DEFS[key]["desc"]}')
+ 
+def show_achievements(p):
+
+    slow_print('🏅 Conquistas:')
+
+    if not p.achievements:
+
+        print('Nenhuma conquista ainda.')
+
+    for k, v in p.achievements.items():
+
+        print(f'- {v["title"]}: {v["desc"]}')
+ 
+#========================
+#------ MAIN -----------
+#========================
+ 
+def main():
+
+    for l in LORE_INTRO: slow_print(l)
+
+    choice = input('1.Novo 2.Load 3.Importar Save > ')
+
+    p = None
+    
+    if choice == '2':
+        p = load_game()
+    elif choice == '3':
+        # Import save from file
+        filename = input('Nome do arquivo de save para importar (ex: save_Hero.pkl): ')
+        p = load_game(filename)
+
+    if not p:
+        nome = input('Nome: ')
+        classe = escolher_classe()
+        p = Player(nome, classe)
+        recalcular_estatisticas(p)
+        print(f'✨ Você escolheu a classe {classe}!')
+ 
+    while p.health > 0:
+
+        p.display_status()
+
+        print('\n1.Ferreiro 2.Alquimista 3.Guilda 4.Dungeon 5.Save 6.Sair 7.Companheiro 8.Conquistas 9.Download Save 10.Atributos 11.Habilidades')
+
+        op = input('> ')
+
+        if op == '1': 
+            blacksmith(p)
+
+        elif op == '2': 
+            alchemist(p)
+
+        elif op == '3': 
+            guild(p)
+
+        elif op == '4': 
+            dungeon(p)
+
+        elif op == '5': 
+            filename = save_game(p)
+            if filename:
+                print(f'✅ Save salvo em: {filename}')
+
+        elif op == '6': 
+            break
+
+        elif op == '7': 
+            companion_menu(p)
+
+        elif op == '8': 
+            show_achievements(p)
+
+        elif op == '10':
+            distribuir_atributos(p)
+
+        elif op == '11':
+            skill_tree_menu(p)
+
+        elif op == '9':
+            # Download the save file
+            filename = f'save_{p.name}.pkl'
+            if os.path.exists(filename):
+                serve_file_for_download(filename)
+            else:
+                print('❌ Nenhum save para fazer download. Salve primeiro (opção 5).')
+ 
+if __name__ == '__main__':
+
+    main()
